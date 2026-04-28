@@ -263,7 +263,7 @@ python experiment_after.py
 
 > Note down the output and compare with the before results.
 
-<!-- TODO: Add comparison image here -->
+![Before vs After Output](Images/Experiment1.png)
 
 ---
 
@@ -419,4 +419,4 @@ python experiment2.py
 
 ### Step 9: Results
 
-<!-- TODO: Add output image here -->
+![Before vs After Output](Images/Experiment2.png)
