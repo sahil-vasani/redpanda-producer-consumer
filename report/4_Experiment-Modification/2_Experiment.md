@@ -263,7 +263,7 @@ python experiment_after.py
 
 > Note down the output and compare with the before results.
 
-![Before vs After Output](Images/Experiment1.png)
+![Before vs After Output](redpanda/Images/Experiment1.png)
 
 ---
 
@@ -421,4 +421,4 @@ python experiment2.py
 
 ### Step 9: Results
 
-![Before vs After Output](Images/Experiment2.png)
+![Before vs After Output](redpanda/Images/Experiment2.png)
