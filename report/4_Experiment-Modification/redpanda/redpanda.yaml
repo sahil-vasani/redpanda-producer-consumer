@@ -1,0 +1,20 @@
+redpanda:
+  data_directory: /tmp/redpanda/data
+  node_id: 0
+
+  developer_mode: true
+  auto_create_topics_enabled: true
+
+  rpc_server:
+    address: 127.0.0.1
+    port: 33145
+
+  kafka_api:
+    - address: 127.0.0.1
+      port: 9092
+
+  advertised_kafka_api:
+    - address: 127.0.0.1
+      port: 9092
+
+  seed_servers: []

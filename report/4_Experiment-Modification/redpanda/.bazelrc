@@ -1,0 +1,344 @@
+common --registry=https://bcr.bazel.build
+common --extra_toolchains=@current_llvm_toolchain//:all
+
+common --@toolchains_llvm//toolchain/config:libunwind=False
+common --@toolchains_llvm//toolchain/config:compiler-rt=False
+build --linkopt --unwindlib=libgcc
+build --linkopt -stdlib=libc++
+
+# Use Bash instead of system python for finding the hermetic interpreter
+# within Bazel due to the `python3` binary not being present on CI
+# (it has `python` version 3 but Bazel uses the `python3` executable).
+common --@rules_python//python/config_settings:bootstrap_impl=script
+
+# By default build without CGO
+build --@rules_go//go/config:pure
+
+build:gofips --//bazel:gofips=True --@rules_go//go/toolchain:sdk_name=go_sdk_with_systemcrypto
+build:gofips --@rules_go//go/config:pure=false
+
+# Improve caching and readability of filepaths that the compiler uses by not using
+# absolute paths, and instead use paths that are relative to the redpanda repo.
+# https://github.com/bazel-contrib/toolchains_llvm/pull/445#issuecomment-2605443516
+build --copt=-ffile-compilation-dir=. --host_copt=-ffile-compilation-dir=.
+
+build:system-clang --extra_toolchains=@local_config_cc_toolchains//:all
+build:system-clang --action_env=BAZEL_COMPILER=clang
+build:system-clang --cxxopt=-std=c++23 --host_cxxopt=-std=c++23
+build:system-clang --linkopt -fuse-ld=lld --host_linkopt -fuse-ld=lld
+
+# Use new proto toolchain resolution
+build --incompatible_enable_proto_toolchain_resolution
+# Keep source info - bigger descriptors (not a problem at our scale),
+# but allows for printing comments in generated protos
+build --experimental_proto_descriptor_sets_include_source_info
+
+# https://github.com/bazelbuild/rules_foreign_cc/issues/1065
+# https://github.com/bazelbuild/rules_foreign_cc/issues/1186#issuecomment-2053550487
+build --host_action_env=CXXFLAGS=-Wno-int-conversion
+build --action_env=CXXFLAGS=-Wno-int-conversion
+build --host_action_env=CFLAGS=-Wno-int-conversion
+build --action_env=CFLAGS=-Wno-int-conversion
+
+build --keep_going
+
+# Enable a hardened libc++ for our debug and fastbuilds. Maybe someday we can enable
+# the fast mode in production as well.
+#
+# https://libcxx.llvm.org/Hardening.html
+build --cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE
+build --host_cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE
+
+# prevent actions and tests from using the network. anything that needs to
+# opt-out (e.g. a network test) can use `tags=["requires-network"]`.
+build --sandbox_default_allow_network=false
+
+# prevent certain environment variables (e.g. PATH and LD_LIBRARY_PATH) from
+# leaking into the build.
+build --incompatible_strict_action_env
+
+# Add stack guards by default for better debugging, we disable them in release builds
+build --@seastar//:stack_guards=True
+# Debug mode by default. Disabled in release builds.
+build --@seastar//:debug=True
+
+# Protobuf 33.5 contains internal uses of deprecated APIs (specifically the
+# RepeatedPtrField constructor in map_field.h, deprecated in favor of
+# Arena::Create<RepeatedPtrField<...>>(Arena*)). Since this deprecation occurs
+# in third-party headers we cannot modify, we suppress the warning for internal
+# files that include protobuf-generated code. These warnings would otherwise be
+# treated as errors due to -Werror,-Wdeprecated-declarations.
+build --per_file_copt=src/v/serde/protobuf/tests/round_trip_test.cc@-Wno-deprecated-declarations
+build --per_file_copt=src/v/serde/protobuf/tests/parser_test.cc@-Wno-deprecated-declarations
+build --per_file_copt=src/v/iceberg/conversion/tests/iceberg_protobuf_tests.cc@-Wno-deprecated-declarations
+build --per_file_copt=src/v/pandaproxy/schema_registry/protobuf.cc@-Wno-deprecated-declarations
+build --per_file_copt=.*\\.pb\\.cc@-Wno-deprecated-declarations
+# Suppress deprecated declarations in the protobuf external module itself
+build --per_file_copt=external/protobuf.*@-Wno-deprecated-declarations
+build --host_per_file_copt=external/protobuf.*@-Wno-deprecated-declarations
+
+# -base configs generally aren't meant to be used directly but are
+# helpers to DRY later user-facing configs
+
+# base for all sanitizer configs
+# seastar has to be run with system allocator when using ASAN
+build:san-base --@seastar//:system_allocator=True
+build:san-base --linkopt=-fsanitize-link-c++-runtime
+
+# base for dev configs
+build:dev-base --config=san-asan-only
+# Og is similar to O1 but gives slightly better debugging experience
+build:dev-base --copt=-Og
+
+####################################################
+# MIXIN CONFIGS
+#
+# These configurations are ones you can plausibly add to your build
+# command in addition to a single primary build mode in order to
+# opt-in to specific features.
+#
+# That's the idea anyway: in practice not all mixins will work
+# together, nor do all mixins work in all build modes. In those cases
+# we try to note the restrictions below.
+####################################################
+
+#########################
+## debug symbols mixins #
+#########################
+
+# line numbers only: backtrace decoding will work, not good for debugger
+build:dbgsym-lines --copt=-gline-tables-only --strip=never
+# full symbols, great for debugging
+build:dbgsym-all --copt=-g --strip=never
+
+#####################
+## sanitizer mixins #
+#####################
+
+# san-asan-only mixin: only enables address sanitizer
+build:san-asan-only --config=san-base
+build:san-asan-only --//bazel:sanitizer_mode=asan
+build:san-asan-only    --copt=-fsanitize=address
+build:san-asan-only --linkopt=-fsanitize=address
+
+# san-all mixin: enables all sanitizers
+build:san-all  --config=san-base
+build:san-all  --//bazel:sanitizer_mode=all
+build:san-all     --copt=-fsanitize=address,undefined,vptr,function,alignment
+build:san-all  --linkopt=-fsanitize=address,undefined,vptr,function,alignment
+
+# LTO mixin: enable LTO for C++ and Rust. Usually mixed in with
+# PGO + release, but should work with any.
+build:lto --copt -flto=thin
+build:lto --linkopt -flto=thin
+build:lto --@rules_rust//rust/settings:lto=fat
+build:lto --@rules_rust//rust/settings:extra_rustc_flag=-Ccodegen-units=1
+# I've seen others claim these flags help with LTO and the final binary, but these also
+# require a specific version of clang and I don't really want to tie rustc version with
+# clang version.
+# build:lto --@rules_rust//rust/settings:extra_rustc_flag=-Clinker-plugin-lto
+# build:lto --@rules_rust//rust/settings:extra_rustc_flag=-Cembed-bitcode=yes
+# build:lto --@rules_rust//rust/settings:extra_rustc_flag=-Clink-arg=-fuse-ld=lld
+
+################################################
+# PRIMARY BUILD MODES
+#
+# Primary build modes define the overall build configuration. It only makes sense
+# to select one of these in a given bazel invocation (or zero, which is the same
+# as selecting fastbuild).
+#
+# These map directly to BUILD_TYPE in task/cmake #
+##################################################
+
+# =================================
+# Fastbuild
+# =================================
+# We want to have a --config=fastbuild that is effectively the same as no args
+# so specify a flag that does nothing to enable this
+build:fastbuild --build
+
+# =================================
+# Dev
+# =================================
+# Development build mode, intended to be best for non-debugger development.
+# Good build speed, good runtime speed.
+build:dev --config=dev-base --config=dbgsym-lines
+
+# =================================
+# Debugger
+# =================================
+# A mode optimized for running in a debugger, i.e., with no optimization
+# and full symbols. This uses -O0, so Redpanda will run very slowly, which
+# may be unsuitable for some uses. In that case, you might prefer --config=debug.
+# Note that --config=debug is based on this config, so changes to this config
+# will flow through to --config=debug as well.
+build:debugger --compilation_mode=dbg
+build:debugger --config=san-all
+build:debugger --config=dbgsym-all
+
+# =================================
+# Debug
+# =================================
+# Debug mode used in the "debug" CI builds and includes all sanitizers,
+# and full symbols. Runs with -O1 so is faster than --config=debugger,
+# but debugger use more difficult due to optimizations (i.e., many symbols
+# will be missing, etc).
+build:debug --config=debugger
+build:debug --copt=-O1
+
+# =================================
+# Fuzz
+# =================================
+# Fuzz configuration for running fuzz tests. It includes the coverage information
+# that libFuzzer needs to guide fuzzing. Fuzz tests still run without this, but
+# the state space will be poorly explored, you will see a message like:
+#
+# WARNING: no interesting inputs were found so far. Is the code instrumented for coverage?
+# This may also happen if the target rejected all inputs we tried so far
+#
+# https://llvm.org/docs/LibFuzzer.html
+build:fuzz --config=debug
+build:fuzz --copt=-fsanitize=fuzzer-no-link
+
+# =================================
+# ODR Finder
+# =================================
+build:odr-finder --cxxopt -stdlib=libc++
+build:odr-finder --copt -g
+build:odr-finder --copt -O0
+build:odr-finder --linkopt -fuse-ld=gold
+build:odr-finder --linkopt -Wl,--detect-odr-violations
+build:odr-finder --linkopt -lc++
+build:odr-finder --linkopt -lc++abi
+build:odr-finder --strip never
+build:odr-finder --@krb5//:linker=gold
+
+# =================================
+# clang-tidy
+# =================================
+build:clang-tidy --aspects //bazel/clang_tidy:clang_tidy.bzl%clang_tidy_aspect
+build:clang-tidy --copt -Wno-pragma-once-outside-header
+build:clang-tidy --output_groups=report
+
+# =================================
+# Security
+# =================================
+
+# fortify source requires a high optimization level. when using this feature add
+# `--copt -O2` or combine with a compilation mode like `-c opt`. the default
+# bazel toolchain adds _FORTIFY_SOURCE=1 in `-c opt`, so first clear the
+# definition to avoid -Wmacro-redefined warnings.
+build:fortify-source --copt -U_FORTIFY_SOURCE
+build:fortify-source --copt -D_FORTIFY_SOURCE=2
+
+build:stack-clash --copt -fstack-clash-protection
+build:stack-protector --copt -fstack-protector-strong
+build:relro --copt -fno-plt
+build:relro --linkopt -Wl,-z,relro,-z,now
+
+# Use `--config=secure` for all supported security settings
+build:secure --config=fortify-source
+build:secure --config=stack-clash
+build:secure --config=stack-protector
+build:secure --config=relro
+
+# =================================
+# Release
+# =================================
+# Enables full optimization, and other release features. Simply using
+# --config=release doesn't create a _true_ release binary, that needs at
+# least --stamp=full and PGO-specific compile steps (outside of bazel).
+build:release --compilation_mode opt
+build:release --config=secure
+build:release --@seastar//:stack_guards=False --@seastar//:debug=False
+build:release --copt -g --strip=never
+# For now, disable the hardened libc++ for release builds for maximum perf 🚀
+build:release --cxxopt=-U_LIBCPP_ASSERTION_SEMANTIC
+build:release --cxxopt=-U_LIBCPP_HARDENING_MODE
+build:release --host_cxxopt=-U_LIBCPP_HARDENING_MODE
+build:release --cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE
+build:release --host_cxxopt=-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE
+
+
+# Instrumentation/training step
+# Empty arg is intentional, we provide the path via env var at run time
+build:pgo-instrument --config=lto --fdo_instrument=
+
+# Final/Optimization build step
+
+# We can't include this in here as bazel wants an absolute path (and we don't
+# really know that) as all the common dirs like /tmp are sandboxed so we can't
+# use them. We pass --fdo_optimize from task instead where the full path is known.
+# build:pgo-optimize --fdo_optimize=
+
+# bazel seems to pass -fprofile-correction unconditionally but that only exists
+# in gcc so need to make clang ignore it
+build:pgo-optimize --config=lto --copt -Wno-ignored-optimization-argument
+
+
+build:stamp --stamp --workspace_status_command=./bazel/stamp_vars.sh
+build:stamp-full --stamp --workspace_status_command='./bazel/stamp_vars.sh full'
+
+# =================================
+# Coverage
+# =================================
+coverage --config=coverage
+build:coverage --action_env=BAZEL_USE_LLVM_NATIVE_COVERAGE=1
+build:coverage --action_env=GCOV=llvm-profdata
+build:coverage --copt=-DNDEBUG
+build:coverage --define=dynamic_link_tests=true
+build:coverage --combined_report=lcov
+build:coverage --experimental_use_llvm_covmap
+build:coverage --experimental_generate_llvm_lcov
+build:coverage --experimental_split_coverage_postprocessing
+build:coverage --experimental_fetch_all_coverage_outputs
+build:coverage --collect_code_coverage
+build:coverage --instrumentation_filter="^//src/v[/:]"
+
+# sanitizer is a deprecated alias for debug
+build:sanitizer --config=debug
+
+# =================================
+# Antithesis
+# =================================
+# Build mode for Antithesis testing. Enables coverage instrumentation
+# that Antithesis uses for guided exploration. Debug symbols are included
+# for symbolization (placed in /symbols in the container image).
+build:antithesis --//bazel:antithesis=True
+build:antithesis --compilation_mode=opt
+build:antithesis --per_file_copt=src/v/.*@-fsanitize-coverage=trace-pc-guard
+build:antithesis --linkopt=-Wl,--build-id
+build:antithesis --linkopt=-Wl,--allow-shlib-undefined
+build:antithesis --copt=-g --strip=never
+build:antithesis --@seastar//:stack_guards=False
+
+# =================================
+# Testing
+# =================================
+
+# prints out combined stdout/stderr for failed tests
+test --test_output=errors
+
+# warn if a timeout is much longer than actual runtime
+test --test_verbose_timeout_warnings
+
+# Use --config=lldb to run a test under lldb
+# to connect run `gdb-remote 7654` in an lldb session
+test:lldb --run_under='@current_llvm_toolchain_llvm//:bin/lldb-server g :7654 --'
+# Bump timeout to 1h
+test:lldb --test_timeout=3600
+test:lldb --strategy=TestRunner=local
+
+# An indicator you want to use io_uring. Currently this
+# just enables the io_uring reactor backend when running
+# benchmarks and unit tests, but in the future it may do
+# more. Note there is also --@seastar//:io_uring, which
+# already defaults to true: that flag determines if Seastar
+# is built with io_uring support at all.
+build:io_uring --//bazel:io_uring=True
+
+# always pass through the following variables if they are set in the environment
+test --test_env=REDPANDA_RNG_SEEDING_MODE
+test --test_env=REDPANDA_DEBUG_TEST_HOOKS
+
+try-import %workspace%/user.bazelrc
